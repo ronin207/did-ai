@@ -1,0 +1,673 @@
+# Verifiable Digital Identity for AI Agents — End‑to‑End Project Blueprint
+
+> Goal: Ship a working prototype where an AI agent can **prove its identity** and **present time‑limited, least‑privilege authorization** to a third‑party API using open standards (DID, VC v2.0, OID4VCI/OID4VP, SD‑JWT VC, OAuth 2.0 DPoP). Includes revocation, audit logging, and clear test cases.
+
+---
+
+## 1) Objectives & Non‑Goals
+
+### Objectives
+
+- Give each agent a verifiable, portable identity (a **DID** with cryptographic keys).
+- Let a **user** delegate a **specific, time‑bound permission** to that agent via a **Verifiable Credential (VC)**.
+- Allow a **verifier/resource server** to request a **verifiable presentation** and issue a **DPoP‑bound access token** only if the credential is valid, in scope, and unrevoked.
+- Provide **revocation** (status lists) and **audit logging** for accountability and traceability.
+
+### Non‑Goals (MVP)
+
+- Full production hardening (HA HSMs, full incident runbooks, rotations across multi‑regions). We document patterns and defaults, but MVP remains single‑region demo‑grade.
+- Advanced ZK presentations (BBS+, zk‑SNARKs) — included as stretch goals and design notes.
+
+---
+
+## 2) Architecture Overview
+
+**Core components**
+
+- **Agent**: owns a DID + private keys; stores received VCs; answers proof challenges; calls APIs with DPoP.
+- **User Issuer UI**: issues **PermissionCredential** (VC) to the agent using **OID4VCI**.
+- **Verifier / Resource Server (RS)**: protects a resource; requests a presentation (**OID4VP**); verifies VC + status; mints **DPoP‑bound** access token; enforces scope/audience/expiry.
+- **Status List Service**: publishes Bitstring Status List (revocation/suspension at scale).
+- **KMS / Key Store**: persistent key management (file, cloud KMS, HSM in prod).
+
+```mermaid
+flowchart LR
+  subgraph User Issuer UI
+    UI[Issuer UI] --> ISSUER[OID4VCI Issuer]
+  end
+  subgraph Agent
+    A[Agent Wallet\n(DID, keys, VCs)] -->|OID4VCI| ISSUER
+    A -->|OID4VP Presentation| RS
+    A -->|DPoP HTTP| RS
+  end
+  subgraph Verifier/RS
+    RS[Verifier + Resource Server] --> SL[Status List]
+    RS --> LOG[Audit Log]
+  end
+  SL[(Bitstring Status List)]
+```
+
+**High‑level phases**
+
+1. **Provisioning**: Agent creates a DID/keypair; publishes DID Doc if needed.
+2. **Issuance (OID4VCI)**: User issues **PermissionCredential** to the Agent Wallet.
+3. **Presentation (OID4VP)**: RS sends challenge; agent returns verifiable presentation with selective disclosure.
+4. **Token (OAuth 2.0 DPoP)**: RS/AS issues a DPoP‑bound access token; agent calls the protected API.
+5. **Revocation & Audit**: RS checks status list; logs all decisions with hashes/timestamps.
+
+---
+
+## 3) Trust & Threat Model
+
+**Trusted statements**
+
+- The **Issuer** accurately encodes the user’s intent in a PermissionCredential.
+- The **Agent** controls the private key corresponding to its DID (proof of possession).
+- The **RS/Verifier** correctly validates VPs/VCs, status, and DPoP proofs.
+
+**Key threats & mitigations**
+
+- **Impersonation**: All requests signed; DPoP binds tokens to the agent’s key; short token TTL; strict `aud`.
+- **Over‑privilege**: Scopes are granular; PermissionCredential has `aud`, `exp/nbf`, and optional `nonce`/one‑time guards.
+- **Replay**: OID4VP nonce + time window; DPoP `jti` unique per request.
+- **Key theft**: KMS for keys; rotate keys; disable old keys via DID Doc update (where applicable).
+- **Privacy leakage**: **SD‑JWT VC** for selective disclosure; only disclose `{scope, aud, exp}` in MVP.
+- **Stale grants**: **Bitstring Status List**; RS checks status URL; cache with ETags + freshness windows.
+
+---
+
+## 4) Standards & Profiles (MVP choices)
+
+- **Identifiers**: W3C DID Core; start with `did:key` (zero infra), optionally `did:web` (easy discoverability), or ION/BTCR later.
+- **Credentials**: W3C **Verifiable Credentials Data Model v2.0**.
+- **Credential format (MVP)**: **SD‑JWT VC** (JWT‑based selective disclosure); alternative: VC‑JWT (no SD), or Data Integrity+BBS+ later.
+- **Issuance**: **OpenID for Verifiable Credential Issuance (OID4VCI)**.
+- **Presentation**: **OpenID for Verifiable Presentations (OID4VP)**.
+- **Status/Revocation**: **Bitstring Status List v1.0**.
+- **Authorization to APIs**: OAuth 2.0 with **DPoP** (Demonstration of Proof‑of‑Possession).
+- **Optional messaging**: DIDComm v2 for agent↔agent secure messaging.
+
+> Rationale: These picks maximize **interoperability** with current wallets/verifiers while staying simple to prototype.
+
+---
+
+## 5) Data Models (JSON examples)
+
+### 5.1 AgentCredential (optional but recommended)
+
+Asserts that a given DID represents an AI agent with certain metadata.
+
+```json
+{
+  "iss": "did:web:issuer.example",
+  "sub": "did:key:z6Mk...Agent",
+  "type": ["VerifiableCredential", "AgentCredential"],
+  "vc": {
+    "credentialSubject": {
+      "agent": {
+        "model": {"name": "MyAgent", "version": "0.3.1"},
+        "algorithms": ["ES256", "EdDSA"],
+        "pubKeyThumbprint": "E3V..."
+      },
+      "owner": "did:web:user.example"
+    },
+    "expirationDate": "2026-01-01T00:00:00Z"
+  }
+}
+```
+
+### 5.2 PermissionCredential (core of MVP)
+
+Time‑bound, least‑privilege grant from **user (issuer)** to **agent (subject)**.
+
+```json
+{
+  "iss": "did:web:user.example",       
+  "sub": "did:key:z6Mk...Agent",       
+  "type": ["VerifiableCredential", "PermissionCredential"],
+  "vc": {
+    "credentialSubject": {
+      "scope": "calendar.read:public",
+      "aud": "https://api.calendar.example",
+      "policyRef": "https://policies.example/pc-123",
+      "constraints": {
+        "method": "GET",
+        "rateLimit": 60,
+        "resourcePaths": ["/v1/calendar/public"]
+      }
+    },
+    "credentialStatus": {
+      "type": "BitstringStatusListEntry",
+      "statusListCredential": "https://status.example/lists/perm-v1",
+      "statusListIndex": "7842",
+      "statusPurpose": "revocation"
+    },
+    "issuanceDate": "2025-09-06T07:30:00Z",
+    "expirationDate": "2025-09-06T07:40:00Z"
+  }
+}
+```
+
+> **SD‑JWT VC**: Put sensitive fields behind SD; disclose only `{scope, aud, expirationDate}` when presenting.
+
+### 5.3 OID4VP Presentation response (trimmed)
+
+```json
+{
+  "vp_token": "eyJ...",
+  "presentation_submission": {
+    "definition_id": "perm-vp-1",
+    "descriptor_map": [
+      {"id": "permcred", "format": "jwt_vc", "path": "$.vp_token"}
+    ]
+  },
+  "state": "nonceFromVerifier"
+}
+```
+
+### 5.4 DPoP proof header (per HTTP request)
+
+- JOSE header: `{ "typ": "dpop+jwt", "alg": "EdDSA", "jwk": { ...public JWK... } }`
+- Claims: `{ "htu": "https://api.calendar.example/v1/calendar/public", "htm": "GET", "jti": "uuid", "iat": 1693989010 }`
+
+The access token includes a `cnf.jkt` (thumbprint) matching the DPoP public key.
+
+### 5.5 Audit Log event (normalized)
+
+```json
+{
+  "ts": "2025-09-06T07:31:03.124Z",
+  "event": "authorization_grant",
+  "agentDid": "did:key:z6Mk...Agent",
+  "issuerDid": "did:web:user.example",
+  "vcId": "urn:uuid:1c3b...",
+  "statusUrl": "https://status.example/lists/perm-v1",
+  "statusIdx": 7842,
+  "aud": "https://api.calendar.example",
+  "scope": "calendar.read:public",
+  "exp": "2025-09-06T07:40:00Z",
+  "requestHash": "sha256-QQZ...",
+  "decision": "allow"
+}
+```
+
+---
+
+## 6) API Contracts (minimal)
+
+### 6.1 Issuer (OID4VCI)
+
+- `POST /oid4vci/issue` — Pre‑authorized code grant or direct issue for POC.
+  - Input: Agent DID + proof of possession (DID‑auth or signed challenge), requested VC type (`PermissionCredential`), claims.
+  - Output: SD‑JWT VC (as compact JWT), or issuance error.
+- `GET /status/:listId` — Returns Bitstring Status List Credential (CBOR/JSON); cacheable.
+
+### 6.2 Verifier / Resource Server (RS)
+
+- `GET /protected/resource` → returns **OID4VP challenge** if no token/VP.
+  - Challenge contains `nonce`, `aud`, and presentation definition (`perm-vp-1`).
+- `POST /present` — Agent posts VP response (OID4VP). RS verifies and, on success, issues a **DPoP‑bound access token** (short TTL, e.g., 120s).
+- `GET /protected/resource` (with `Authorization: DPoP <access_token>` and `DPoP: <proof>`) — RS validates token, DPoP, scope, audience, expiry, revocation; returns data.
+
+### 6.3 Agent Wallet
+
+- `POST /wallet/store` — save VC; encrypted at rest.
+- `POST /wallet/present` — construct OID4VP response (with SD).
+- `POST /wallet/dpop` — create DPoP proof for a given method+URL.
+
+---
+
+## 7) Implementation Plan (Step‑by‑Step)
+
+### Step 0 — Repo skeleton
+
+```
+/agent            (Node/TS service; wallet + DID + presenter)
+/issuer           (Node/TS or Java w/ walt.id; OID4VCI + Status List)
+/verifier-rs      (Node/TS; OID4VP verify + OAuth DPoP + resource)
+/shared           (schemas, types, crypto utils)
+infra/            (docker-compose, reverse proxy, TLS for localhost)
+```
+
+### Step 1 — Identity & Keys
+
+- Choose DID method: `` for MVP (no registry); optionally also support `` for demo discoverability.
+- Implement key generation (Ed25519) via `@noble/ed25519` or `jose`.
+- Export public JWK + compute thumbprint (for DPoP `cnf.jkt`).
+- Create DID Document in memory (for `did:key`, derive from key); for `did:web`, publish a JSON at `/.well-known/did.json`.
+
+### Step 2 — Agent Wallet
+
+- Secure store: JSON keystore + encrypted VC storage (AES‑GCM with key from env/OS KMS). For demo, file‑based with a passphrase.
+- Functions: `storeVC(vcJwt)`, `getVCsByType("PermissionCredential")`, `createPresentation(challenge)` (disclose minimal claims if SD‑JWT).
+
+### Step 3 — Issuer (OID4VCI) + Status List
+
+- Implement a very small OID4VCI:
+  - Accepts `agentDid`, `proof` (DID‑auth: a signed nonce), requested claims.
+  - Mints SD‑JWT VC for `PermissionCredential` and returns it.
+- **Status list**:
+  - Host a Bitstring Status List Credential at `https://status.example/lists/perm-v1`.
+  - Keep an in‑memory bitset + periodic persistence; expose admin endpoint to set `revoked(index=true/false)`.
+
+### Step 4 — Verifier/RS (OID4VP + DPoP)
+
+- `GET /protected/resource`:
+  - If no valid token, return OID4VP challenge `{ nonce, aud, presentation_definition }`.
+- `POST /present`:
+  - Validate VP: signature, SD disclosures, `aud`, `exp/nbf`, `nonce`, **status check** (download/cached bitstring); ensure `scope` matches resource.
+  - On success, issue short‑lived **DPoP‑bound** access token JWT with `cnf.jkt` claim; include `scope`, `aud`, `exp` (≤120s), `iss`.
+- On subsequent resource calls, verify:
+  - Access token signature + `exp`, `aud`, `scope`.
+  - **DPoP proof**: header JWK thumbprint must equal `cnf.jkt`; verify `hti/htm`, `jti` (no replay), `iat` skew.
+
+### Step 5 — Frontend (User Issuer UI)
+
+- Minimal React (or simple form): select scope, audience, expiry; click **Issue** → calls Issuer to mint VC for `agentDid`.
+- Display status of grants; allow **Revoke** (flip bit in status list).
+
+### Step 6 — Observability & Audit
+
+- Standardize audit log schema (see §5.5).
+- Console + JSON file sink; optional SQLite/ClickHouse for querying.
+- Add correlation IDs for each flow; log VP hash (no PII), decision, reason codes.
+
+### Step 7 — Security Hardening (MVP‑grade)
+
+- TLS even on localhost via mkcert (or reverse proxy with self‑signed certs).
+- Env secrets via `.env` + optional OS keychain.
+- Rate limiting on issuer & verifier endpoints.
+- Unit tests: VC verification, status revocation toggling, DPoP validation, nonce replay rejection.
+
+---
+
+## 8) Configuration & Dev Setup
+
+### Prereqs
+
+- Node.js ≥ 20; pnpm or yarn.
+- `openssl` (for quick certs) or `mkcert` for local TLS.
+- Optional: Docker + docker‑compose.
+
+### Environment variables (example)
+
+```
+# issuer
+ISSUER_DID=did:web:issuer.local.test
+ISSUER_SIGNING_KEY_BASE64=...  # Ed25519 private key
+STATUS_LIST_URL=https://issuer.local.test/status/lists/perm-v1
+
+# verifier / RS
+RS_ISS=https://api.calendar.local.test
+RS_SIGNING_KEY_BASE64=...
+TOKEN_TTL_SECONDS=120
+ALLOWED_AUDIENCES=https://api.calendar.local.test
+REQUIRED_SCOPE=calendar.read:public
+
+# agent
+AGENT_DID_METHOD=did:key
+AGENT_WALLET_PASSPHRASE=changeit
+```
+
+### Directory structure (starter)
+
+```
+agent/
+  src/keys.ts       # keygen, did:key
+  src/wallet.ts     # store/load VCs (encrypted)
+  src/present.ts    # build OID4VP payloads
+  src/dpop.ts       # make DPoP proofs
+  src/client.ts     # call verifier & resource
+issuer/
+  src/oid4vci.ts    # issue SD-JWT VC
+  src/status.ts     # bitstring status list
+verifier-rs/
+  src/challenge.ts  # OID4VP challenge endpoints
+  src/verify.ts     # verify VP & status
+  src/token.ts      # mint DPoP-bound tokens
+  src/resource.ts   # protected endpoint
+shared/
+  schemas/
+  crypto/
+```
+
+---
+
+## 9) End‑to‑End Flows (with example payloads)
+
+### 9.1 Provisioning (Agent)
+
+1. Agent generates Ed25519 key pair.
+2. Constructs `did:key` DID Document.
+3. Stores keys in encrypted keystore.
+
+### 9.2 Issuance (User → Agent via OID4VCI)
+
+1. Agent requests a VC from Issuer with a DID‑auth proof over a server nonce.
+2. Issuer validates proof, builds `PermissionCredential` (claims: `scope`, `aud`, `exp`, status entry), signs as SD‑JWT VC, returns credential.
+3. Agent stores VC.
+
+**cURL (POC)**
+
+```bash
+curl -X POST https://issuer.local.test/oid4vci/issue \
+  -H 'content-type: application/json' \
+  -d '{
+    "agentDid": "did:key:z6Mk...",
+    "proof": {"type": "did-auth", "jws": "eyJ..."},
+    "requestedClaims": {"scope":"calendar.read:public","aud":"https://api.calendar.local.test","exp": 1693989600}
+  }'
+```
+
+### 9.3 Access Attempt → OID4VP Challenge
+
+1. Agent calls `GET /protected/resource`.
+2. RS replies 401 with JSON: `{ nonce, aud, presentation_definition }`.
+
+### 9.4 Presentation (Agent → RS)
+
+1. Agent builds VP containing the PermissionCredential (SD‑JWT with selective disclosure) and echoes `state/nonce`.
+2. RS verifies signatures, SD disclosures, `aud`, `exp/nbf`, `nonce`, and **status** (download/cached bitstring). If ok → proceed.
+
+```bash
+curl -X POST https://api.calendar.local.test/present \
+  -H 'content-type: application/json' \
+  -d '{
+    "vp_token": "eyJ...",
+    "presentation_submission": {"definition_id":"perm-vp-1","descriptor_map":[{"id":"permcred","format":"jwt_vc","path":"$.vp_token"}]},
+    "state": "<nonceFromChallenge>"
+  }'
+```
+
+### 9.5 Token Issuance (DPoP‑bound)
+
+1. RS issues access token JWT (TTL 120s) containing `cnf.jkt` (thumbprint of agent’s public key) + `scope`, `aud`.
+2. Agent stores token in memory.
+
+**Access token (claims)**
+
+```json
+{
+  "iss": "https://api.calendar.local.test",
+  "sub": "did:key:z6Mk...Agent",
+  "aud": "https://api.calendar.local.test",
+  "scope": "calendar.read:public",
+  "exp": 1693989180,
+  "cnf": {"jkt": "G0k...thumbprint"}
+}
+```
+
+### 9.6 Resource Call with DPoP
+
+1. Agent creates DPoP proof JWT for the exact URL+method.
+2. Sends:
+   - `Authorization: DPoP <access_token>`
+   - `DPoP: <proof>`
+3. RS verifies: token signature/exp/aud/scope, **DPoP** header JWK → thumbprint matches `cnf.jkt`; `jti` unique; `iat` recent; `htu/htm` match.
+
+```bash
+curl https://api.calendar.local.test/v1/calendar/public \
+  -H "Authorization: DPoP eyJ...access_token" \
+  -H "DPoP: eyJ...proof"
+```
+
+### 9.7 Revocation
+
+- Issuer flips status bit `index=7842` → RS status check fails next validation cycle; further presentations or token mints are denied.
+
+---
+
+## 10) Testing Matrix
+
+| Test | Scenario                                     | Expected                                      |
+| ---- | -------------------------------------------- | --------------------------------------------- |
+| P1   | Valid VC, in‑status, correct aud, within exp | VP accepted, token issued, resource 200       |
+| N1   | Wrong aud in VC                              | VP rejected (aud mismatch)                    |
+| N2   | Expired VC                                   | VP rejected (exp)                             |
+| N3   | Revoked status bit                           | VP rejected (revoked)                         |
+| N4   | DPoP proof `htu/htm` mismatch                | 401 on resource (invalid DPoP)                |
+| N5   | Replayed `jti`                               | 401 on resource (replay detected)             |
+| N6   | Token without matching `cnf.jkt`             | 401 (sender‑constrained fail)                 |
+| PRIV | SD‑JWT VC with undisclosed claims            | VP accepted if required claims disclosed only |
+
+---
+
+## 11) Operational Guidance
+
+- **TTL defaults**: PermissionCredential ≤ 10 minutes; access tokens 120 seconds.
+- **Clock skew**: Allow ±60s; include `nbf` and `exp` on credentials and tokens.
+- **Caching**: Status list with `Cache‑Control` + `ETag`; RS should refresh on cache miss or soft TTL.
+- **Key rotation**: Agent rotates keys; for `did:web`, update DID Doc; communicate new JWK thumbprint to RS when minting new tokens.
+- **Rate limits**: Per DID and per IP on Issuer/RS.
+- **Logging**: Log only hashes/IDs; avoid full VC payloads in logs.
+
+---
+
+## 12) Libraries & Tools (suggested)
+
+**Node/TypeScript**
+
+- `jose` — JWT/SD‑JWT (via disclosures), JWK, thumbprints, signatures.
+- `@sd-jwt/core` or equivalent — SD‑JWT helpers (if using a helper lib).
+- `did-jwt`, `did-resolver` — DID verification, method drivers if needed.
+- `express` / `fastify` — HTTP.
+- `bitset` — simple status bitstring ops.
+
+**Alternative stacks**
+
+- **walt.id** (Issuer/Verifier/Wallet turnkey; supports SD‑JWT VC, OID4VCI/OID4VP) — faster interop demos.
+- **DIDKit** (Spruce) — DID/VC tooling in Rust with Node bindings.
+- **Aries/ACA‑Py** + **DIDComm v2** — if you prefer Aries agents and DIDComm secure messaging.
+
+---
+
+## 13) Stretch Goals (Post‑MVP)
+
+1. **BBS+ / Data Integrity**: unlinkable selective disclosure for JSON‑LD VCs.
+2. **Capability Delegation**: model permissions as **zcap‑LD** or **UCAN** for chained delegation (user → orchestrator → worker agents) with caveats (method, time, resource, attenuation).
+3. **Execution Attestation**: issue **EnvironmentCredential** (TEE/SGX/SEV or container digest) and **ModelBuildCredential** (supply‑chain attestations). Verifier can then require “only agents attested with build X in environment Y may act.” Map to EAT/RATS if using remote attestation.
+4. **Policy Engine**: OPA/Cedar policy that evaluates VC claims + context for allow/deny; emit reason codes.
+5. **Multi‑tenant Issuer**: segregate issuer keys, namespace status lists, per‑tenant policy.
+
+---
+
+## 14) Glossary
+
+- **DID**: Decentralized Identifier.
+- **VC**: Verifiable Credential.
+- **SD‑JWT VC**: JWT‑based VC supporting selective disclosure via digests + disclosures.
+- **OID4VCI / OID4VP**: OpenID profiles for issuing/presenting VCs.
+- **DPoP**: Sender‑constrained OAuth token bound to a client public key.
+- **RS**: Resource Server (verifier + protected API).
+- **Status List**: Compressed bitstring representing revocation/suspension across many credentials.
+
+---
+
+## 15) Quick Demo Script (Happy Path)
+
+1. **Start services**: issuer, verifier‑rs, agent.
+2. **Issue**: From Issuer UI, create `PermissionCredential` (scope `calendar.read:public`, aud RS, exp +10m). Agent polls or receives via callback → stores VC.
+3. **Access**: Agent calls RS resource → receives OID4VP challenge.
+4. **Present**: Agent returns VP with minimally disclosed claims + nonce.
+5. **Token**: RS issues DPoP‑bound token (TTL 120s).
+6. **Call**: Agent calls resource with `Authorization: DPoP` + `DPoP` header → 200 OK.
+7. **Revoke**: Flip status bit; repeat call → denied at presentation or token mint stage.
+
+---
+
+## 16) License & Compliance Notes
+
+- Use permissive OSS licenses (Apache‑2.0/MIT) for POC code; verify compat with chosen libraries.
+- Avoid storing PII; if demo uses real user identifiers, pseudonymize. Keep logs minimal and privacy‑preserving.
+
+---
+
+## 17) References (for implementers)
+
+- W3C DID Core, VC Data Model v2.0
+- OID4VCI, OID4VP
+- SD‑JWT VC (IETF drafts/implementations)
+- Bitstring Status List v1.0
+- OAuth 2.0 DPoP (RFC 9449)
+- DIDComm v2 (optional)
+
+> These standards are widely documented; use the latest specs and interop profiles from their working groups during implementation.
+
+
+
+---
+
+## 18) Tech Stack — Language‑Specific Recipes (Backend & Frontend)
+
+> You can mix Rust, TypeScript/JavaScript, and Python. Below are **production‑minded** options and a **minimal, interop‑first** baseline. Pick one role per component; you can split by service boundary.
+
+### 18.1 Component Map (who does what)
+
+- **Issuer Service** (OID4VCI + Status List + Admin Revocation)
+- **Verifier/Resource Server (RS)** (OID4VP verification + Token service + Protected API)
+- **Agent Service (Wallet)** (DID/key mgmt, VC storage, OID4VP presenter, DPoP client)
+- **Status List Publisher** (Bitstring artifact generator & CDN hosting)
+- **DID Resolution** (inline for `did:key`/`did:web`; optional generic resolver)
+- **Frontend (Issuer UI + Monitor)** (Issue/revoke credentials; show agent DID, VCs, audit log)
+- **Observability & Ops** (metrics, tracing, logs, CI/CD, security)
+
+### 18.2 Recommended Minimal Baseline (fastest path to demo)
+
+- **Language split**: TS/Node for protocol glue; Rust for crypto‑intensive helpers (via DIDKit or a small Rust sidecar); Python for test harness.
+- **Issuer**: Node (Express/Fastify) + `jose` for signing SD‑JWT VCs; Postgres for issuance records; Redis for issuance nonces; a small Rust sidecar (or DIDKit HTTP) to handle DID/VC canonicalization if needed.
+- **Verifier/RS**: Node (Fastify) + `jose` to validate VPs & mint DPoP‑bound tokens; Redis for OID4VP nonces and DPoP `jti`; Postgres for audit logs.
+- **Agent**: Node (service/CLI) using `jose`; file‑based encrypted wallet (AES‑GCM key from env/OS keychain); simple HTTP client that attaches DPoP.
+- **Status List**: Node script generates compressed bitstring; store JSON/CBOR in S3/MinIO; serve via CDN (CloudFront) with `ETag` and cache headers.
+- **DID methods**: `did:key` local driver (derive from Ed25519); `did:web` by serving `/.well-known/did.json` via the Issuer domain for demo.
+- **Frontend**: Next.js (React+TS) + Tailwind; talks to Issuer & RS; shows VC list and audit events.
+
+This baseline keeps moving parts small and leverages rich JWT tooling in Node. You can later migrate heavy crypto/proof logic to Rust without changing protocols.
+
+### 18.3 Rust‑First Variant (higher assurance)
+
+- **Issuer (Rust)**: Axum/Actix + `ring`/`ed25519-dalek` for signatures; integrate **DIDKit (Rust)** for DID/VC helpers; SQLx with Postgres; background job for status list (RoaringBitmap or bitvec).
+- **Verifier/RS (Rust)**: Axum + `jsonwebtoken`/`josekit` for JWT; custom DPoP verifier (thumbprint, `htu/htm`, `jti` replay cache in Redis); audit via OpenTelemetry + ClickHouse.
+- **Agent (Rust)**: CLI/daemon; encrypted wallet with `age` or `ring` AEAD; reqwest client with DPoP middleware.
+- **Interop**: expose a tiny gRPC/HTTP boundary so TS frontend can call Rust services; keep OID4VCI/OID4VP payloads identical.
+
+### 18.4 Python‑Augmented (testing & glue)
+
+- **Test harness**: `pytest` + `requests` to exercise end‑to‑end flows; use `cryptography` for reference DPoP proof generation; golden vectors for VP validation.
+- **Data tooling**: small Python scripts to diff status lists, compute Merkle roots for anchoring daily logs, etc.
+
+### 18.5 Library/Framework Suggestions (by function)
+
+#### A) JOSE/JWT/SD‑JWT
+
+- **TypeScript**: `jose` (JWT, JWK, thumbprints, DPoP proof JWTs), community **SD‑JWT** helpers or local implementation (digest & disclosure per draft) for MVP.
+- **Rust**: `josekit`/`jsonwebtoken` + custom SD‑JWT utilities if a mature crate is unavailable; leverage DIDKit for VC signing/verification where possible.
+- **Python**: `jwcrypto`/`authlib` for JWT; implement SD‑JWT disclosures if needed for tests.
+
+#### B) DID & VC
+
+- **Rust**: **DIDKit** (Spruce) for DID methods & VC issuance/verification; or minimal local drivers for `did:key` & `did:web`.
+- **TypeScript**: `did-jwt`, `did-resolver` + drivers for `did:key`/`did:web`; or call a Rust DIDKit sidecar over HTTP.
+
+#### C) OID4VCI / OID4VP
+
+- These are HTTP profiles—implement endpoints directly:
+  - **Issuer**: `/oid4vci/issue` (pre‑authorized code/nonce + DID‑auth), returns SD‑JWT VC.
+  - **Verifier**: `/present` endpoint that checks nonce/audience & validates VP; `/.well-known/openid-configuration` (optional) for discoverability.
+- Use a small **presentation\_definition** JSON to request the PermissionCredential.
+
+#### D) OAuth 2.0 DPoP (RS/Token)
+
+- **TypeScript**: implement DPoP using `jose` (create & verify proofs; set `cnf.jkt` in token); tokens as JWT or opaque + Redis.
+- **Rust**: custom validator (verify JOSE header JWK → thumbprint vs token `cnf.jkt`, `htu/htm`, `iat`, `jti` cache).
+
+#### E) Status/Revocation
+
+- Bitstring in Postgres (`bytea`) or Redis bitmap; expose as compressed JSON/CBOR document.
+- Use **RoaringBitmap** (Rust) or `bitset` (TS) for efficient operations.
+
+#### F) Storage & Caches
+
+- **Postgres**: issuance records, audit logs, presentation attempts.
+- **Redis**: OID4VP nonces, DPoP `jti`, short‑lived challenges.
+- **Object storage**: S3/MinIO for status lists; optional CDN in front.
+
+#### G) Crypto & KMS
+
+- **Local dev**: file‑based keystore (encrypted); `.env` secrets via Doppler/SOPS.
+- **Prod**: HashiCorp Vault or cloud KMS (AWS KMS/GCP KMS/Azure Key Vault) with envelope encryption; periodic key rotation; DID Doc updates for `did:web` when rotating.
+
+#### H) HTTP & Frameworks
+
+- **TypeScript**: Fastify (perf) or Express (ubiquitous); Zod for schema validation; Helmet + CORS.
+- **Rust**: Axum/Actix; `serde` for JSON; `tower` middlewares.
+- **Python**: FastAPI for any harness endpoints.
+
+#### I) Frontend (Issuer UI & Monitor)
+
+- **Next.js (React + TS)**, TailwindCSS, TanStack Query, Zod.
+- Pages:
+  - Issue VC form (scope, audience, expiry) → calls Issuer.
+  - Revocation dashboard (flip status bits).
+  - Agent monitor (list VCs, DID, recent audit events via RS API).
+- **Security**: CSRF protection on issuer actions; same‑site cookies if using sessions; or pure SPA + token for admin‑protected endpoints.
+
+#### J) Observability & Security
+
+- **OpenTelemetry** (Node & Rust) → traces to Jaeger/Tempo; metrics to Prometheus.
+- **Structured logs**: pino (TS) / tracing (Rust) → Loki.
+- **Rate limit**: Redis‑based limiter on `/issue` and `/present`.
+- **TLS**: mkcert locally; cert‑manager on K8s; strict TLS everywhere.
+- **CSP/Headers**: Helmet (TS), tower‑http headers (Rust).
+
+### 18.6 Repository & Service Layout
+
+```
+/agent            # TS or Rust agent wallet & client
+/issuer           # OID4VCI + status list
+/verifier-rs      # OID4VP verify + token service + protected API
+/shared           # JSON schemas (Zod/Serde), model types, crypto utils
+/frontend         # Next.js React app (Issuer UI + Monitor)
+/ops              # docker-compose, k8s manifests, mkcert, CI/CD, Makefile
+/tests            # Python pytest harness; golden vectors; smoke scripts
+```
+
+### 18.7 Configuration, Secrets, and Envs
+
+- `.env` (dev) with fallbacks; prod via Vault/KMS.
+- Key envs:
+
+```
+ISSUER_DID=did:web:issuer.local.test
+ISSUER_SIGNING_KEY_BASE64=...
+STATUS_LIST_URL=https://issuer.local.test/status/lists/perm-v1
+RS_ISS=https://api.calendar.local.test
+RS_SIGNING_KEY_BASE64=...
+TOKEN_TTL_SECONDS=120
+ALLOWED_AUDIENCES=https://api.calendar.local.test
+REQUIRED_SCOPE=calendar.read:public
+AGENT_DID_METHOD=did:key
+AGENT_WALLET_PASSPHRASE=changeit
+REDIS_URL=redis://localhost:6379
+DATABASE_URL=postgres://...
+```
+
+### 18.8 CI/CD & Quality Gates
+
+- **CI**: GitHub Actions → lint (ESLint, Clippy), test (Node, Rust, Python), SAST (npm audit, cargo audit), license checks.
+- **CD**: Docker images per service; compose for dev; K8s for staging/prod (Render/Fly.io as lightweight options).
+- **Contract tests**: JSON Schema/Pact for `/issue` and `/present` payloads.
+
+### 18.9 Security Defaults (copy/paste checklist)
+
+- Short TTLs: VC ≤ 10m, token ≤ 120s; skew ±60s.
+- DPoP: verify `alg` ≠ `none`, bound JWK thumbprint, unique `jti` (Redis TTL ≈ token TTL), exact `htu/htm`.
+- OID4VP: require fresh `nonce` & correct `aud`; reject if status bit revoked.
+- Keys: rotate quarterly; pin algorithms (EdDSA/ES256); disable legacy JOSE algs.
+- Logs: no raw VC payloads; hash IDs; redact secrets; enable audit trail with reason codes.
+
+### 18.10 Migration Paths
+
+- **Add BBS+/Data Integrity** later by introducing a parallel verifier pipeline; keep OID4VP challenge identical.
+- **Switch DID method** by adding `did:web` publication; agents re‑issue AgentCredential with new DID and rotate keys.
+- **Harden KMS** by moving from file keystore → Vault/KMS without touching API contracts.
+

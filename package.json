@@ -1,0 +1,20 @@
+{
+  "name": "did-ai",
+  "private": true,
+  "version": "0.0.1",
+  "workspaces": [
+  "shared",
+  "agent",
+  "issuer",
+  "verifier-rs",
+  "web"
+  ],
+  "scripts": {
+  "test": "npm -w shared test && npm -w agent test && npm -w issuer test && npm -w verifier-rs test",
+  "dev:issuer": "npm -w issuer run build && node issuer/dist/server.js",
+  "dev:verifier": "npm -w verifier-rs run build && node verifier-rs/dist/server.js",
+  "dev:web": "npm -w web run dev",
+  "demo": "npm -w shared run build && npm -w issuer run build && npm -w verifier-rs run build && node scripts/full-demo.mjs",
+  "validate": "node scripts/validate-last-demo.mjs"
+  }
+}
